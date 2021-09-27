@@ -1,0 +1,281 @@
+#!/bin/bash
+#
+# vlan - simplified commands for settings up and controlling vlans
+#
+# NB You should disable Nework Manager or Wicked to use this (dhclient will fail if they are running)
+#
+iam=${0##*/}
+#
+#	key commands:
+#		ip link add link base.iface name iface type vlan id vlan    # Create new link
+#                                    |             |                 \----- vlan id - eg 100
+#                                    |             \----------------------- name of new interface, eg eth0.100
+#                                    \------------------------------------- name of base interface, eg eth0
+#		ip addr add a.b.c.d/mask brd a.b.c.d dev iface		    # Assign ip address
+#                               |    |          |         \---------------- name of interface, eg eth0.100
+#                               |    |          \-------------------------- broadcast address, eg 192.168.0.255
+#                               |    \--------------------------------------size of mask, eg 24 (in lieu of netmask)
+#                               \-------------------------------------------ip address
+#		ip addr del a.b.c.d/mask dev iface			    # Delete ip address
+#                               |    |         \--------------------------- name of interface, eg eth0.100
+#                               |    \--------------------------------------size of mask, eg 24 (in lieu of netmask)
+#                               \-------------------------------------------ip address
+#		dhclient -r iface					    # renew ip address
+#		ip link set dev iface [up|down]				    # Bring iface up/down
+#                                 |      \--------------------------------- set interface up/down
+#                                 \-----------------------------------------name of interface, eg eth0.100
+#		ip link delete iface					    # Delete interface
+#
+#	commands to get information
+#		ip -d addr
+#
+#
+
+doOrShow=
+
+doUsage() {
+	cat <<END
+Usage: $iam [show|add|del|mod] --vlan n interface.vlan [ip address|dhcp]
+	show	show the current state of the interface (similar to ip addr, but more succinct)
+		if interface is omitted, will list all
+	add	add a new vlan interface called interface.vlan
+	del	delete the vlan called interface.vlan
+
+	options
+		-v		show more information
+		-e		show commands to run, don't run them
+		--help		show this help
+		--base iface	use iface as the base interface (rather than beginning of interface.vlan)
+		--vlan n	use n as the vlan number (rathern than the end of interface.vlan)
+
+	This script uses the following commands (replace BASE IFACE VLAN A.B.C.D/MASK):
+		ip link add link BASE.IFACE name IFACE type vlan id VLAN	# create new link
+		ip link delete IFACE						# delete interface
+		ip addr add A.B.C.D/MASK dev IFACE				# assign ip address
+		ip addr del A.B.C.D/MASK dev IFACE				# delete ip address
+		ip link set dev IFACE [up|down]					# bring iface up/down
+		ip route add A.B.C.D/MASK [via A.B.C.D|dev IFACE]		# add a route
+		dhclient IFACE							# initiate dhcp discovery
+END
+#	mod	modify the vlan for interface.vlan
+#			change ip address (or renew dhcp)
+
+	exit
+}
+
+# takes an ipaddress and makes it valid (or blank if invalid)
+# input: a.b.c.d/n 
+# output: a.b.c.d n
+saneIP() {
+	ipaddr=$1
+	mask=${ipaddr#*/}
+	[[ $mask =~ ^[0-9]{1,2}$ ]] || mask=24
+	[[ ! $mask -le 32 ]] && mask=24
+	realipaddr=${ipaddr%/*}
+	IFS='.'
+	ipdots=($realipaddr)
+	if [[ ${#ipdots[@]} -eq 4 \
+		&& ${ipdots[0]} -lt 256 \
+		&& ${ipdots[1]} -lt 256 \
+		&& ${ipdots[2]} -lt 256 \
+		&& ${ipdots[3]} -lt 256 ]]; then 
+		ipaddr=${ipdots[*]}/$mask
+		echo "Valid IP Address: $ipaddr" 1>&2
+	else
+		echo "Invalid IP Address: $realipaddr" 1>&2
+		exit
+	fi
+	unset IFS
+	echo $ipaddr
+}
+
+# doAdd $iface $base $vlan $ipaddr
+doAdd() {
+	iface=$1
+	base=$2
+	vlan=$3
+	ipaddr=$4
+	[ "$v" == "TRUE" ] && echo "# Add: $iface on $base [vlan:$vlan] with $ipaddr"
+	[ "$ipaddr" == "" ] && ipaddr=dhcp
+	thisIF=($(doShow $iface))
+	currentBase=($(doShow $base))
+	if [ ${#thisIF[@]} -gt 1 ]; then
+		echo "$iface already exists. Please delete before trying to add again."
+		exit
+	fi
+	if [ ! "$ipaddr" == "dhcp" ]; then
+		ipaddr=$(saneIP $ipaddr)
+		[ "$ipaddr" == "" ] && exit
+	fi
+	$doOrShow ip link add link $base name $iface type vlan id $vlan
+	if [ "$ipaddr" == "dhcp" ]; then
+		[ "$v" == "TRUE" ] && echo "# Add: setting base link to up"
+		$doOrShow ip link set dev $base up
+		[ "$v" == "TRUE" ] && echo "# Add: making dhcp request"
+		vv=""
+		[ "$v" == "TRUE" ] && vv=-v
+		$doOrShow dhclient $vv $iface
+	else
+		$doOrShow ip addr add  $ipaddr dev $iface
+		[ "$v" == "TRUE" ] && echo "# Add: setting link to up"
+		$doOrShow ip link set dev $iface up
+	fi
+}
+
+# doModify $iface $base $vlan $ipaddr
+doModify() {
+	iface=$1
+	thisIF=($(doShow $iface))
+	[ "$v" == "TRUE" ] && echo "# Mod: $iface on $base [vlan:$vlan] with $ipaddr"
+}
+
+# doDelete $iface
+doDelete() {
+	iface=$1
+	thisIF=($(doShow $iface))
+	[ "$v" == "TRUE" ] && echo "# Del: $iface from ${thisIF[11]}"
+	if [ "${thisIF[1]}" == "$iface" ]; then
+		if [ ! ${thisIF[7]} == "unknown" ]; then
+			# If there's an IP address, remove it
+			$doOrShow ip add del ${thisIF[7]} dev ${thisIF[1]}
+		fi
+		[ "$v" == "TRUE" ] && echo "# Del: removing $iface"
+		$doOrShow ip link delete $iface
+	else
+		echo "$iface does not exist. ${thisIF[@]}"
+		exit
+	fi
+}
+
+# doShow [iface]
+# returns: n: iface mac: mac-address vlan: nn ip: [ip|unknown] is [UP|DOWN]] [on baseiface]
+#          0  1     2    3           4     5  6   7            8  9          10 
+doShow() {
+	iface=$1
+	IFS=$'\n'
+	info=(`ip -d addr`)
+	unset IFS
+	info+=("last:")
+	# Lines are:
+	#	n: ifacename
+	#	   link/ether mac
+	#	vlan protocol 802.1Q id vlan
+	#	inet ipaddr/mask brd ipaddr
+	i=0
+	while [ $i -lt ${#info} ]; do
+		line=( ${info[$i]} )
+		if [[ ${line[0]} == *: ]]; then # this is a new interface
+			if [ ! ${line[0]} == 1: ]; then
+				if [ "$v" == "TRUE" ]; then
+					brdToShow="	$brd"
+				else
+					brdToShow=
+				fi
+				doShow=FALSE
+				if [ "$thisiface" == "$iface" ]; then
+					doShow=TRUE
+				else
+					[ "$iface" == "" ] && [ ! "$mac" == "" ] && doShow=TRUE
+				fi
+				if [ "$thisbase" == "" ]; then
+					baseToShow=
+				else
+					baseToShow="on $thisbase"
+				fi
+				# Only show interfaces with a mac address
+				if [ $doShow == TRUE ]; then
+					echo "$seq: $thisiface mac: $mac	vlan: $vlan	ip: $ipaddr	is $state	$baseToShow $brdToShow"
+				fi
+				mac=unknown
+				vlan=none
+				ipaddr=unknown
+				brd=unknown
+			fi
+			seq=${line[0]/:}
+			thisiface=${line[1]/:}
+			thisbase=${thisiface##*@}
+			thisiface=${thisiface%@*}
+			[ "$thisbase" == "$thisiface" ] && thisbase=
+			j=1
+			while [ $j -lt ${#line[@]} ]; do
+				if [ ${line[$j]} == state ]; then
+					j=$(( $j + 1 ))
+					state=${line[$j]}
+				fi
+				j=$(( $j + 1 ))
+			done
+		fi
+		if [[ ${line[0]} == link/ether ]]; then # link
+			mac=${line[1]}
+		fi
+		if [[ ${line[0]} == vlan ]]; then # vlan
+			vlan=${line[4]}
+		fi
+		if [[ ${line[0]} == inet ]]; then # ip addr
+			ipaddr=${line[1]}
+			[[ ${line[2]} == brd ]] && brd=${line[3]}
+		fi
+		i=$(( i + 1 ))
+	done
+}
+
+# Main code begins here
+vlan="0"
+base=""
+help="nohelp"
+
+# First, process the parameters
+#   --A B will turn into variable A=B
+i=0
+while [ $i -le $# ]; do
+	if [ "${!i#-}" == "${!i}" ]; then
+		# It's not -
+		i=$(( i + 1 ))
+	else
+	if [ "${!i#--}" == "${!i}" ]; then
+		# It's not -- (therefore -)
+		declare "${!i#-}=TRUE"
+		params=( "$@" )
+		j=$(( i - 1 ))
+		unset params[$j]
+		set -- "${params[@]}"
+	else
+		# therefore --
+		j=$(( i + 1 ))
+		declare "${!i#--}=${!j}"
+		params=( "$@" )
+		unset params[$i]
+		j=$(( i - 1 ))
+		unset params[$j]
+		set -- "${params[@]}"
+	fi
+	fi
+done
+
+[ "$1" == "" ] && help=help
+[ "$help" == "nohelp" ] || doUsage
+command=$1
+iface=$2
+[ "$vlan" == "0" ] && vlan=${iface#*.}
+[ "$base" == "" ] && base=${iface//.*}
+ipaddr=$3
+
+[ "$v" == "TRUE" ] && echo "# Command: $command; i/face: $iface; base: $base; vlan: $vlan; ipaddr=$ipaddr; verbose:$v help: $help"
+[ "$e" == "TRUE" ] && doOrShow=echo
+
+if [ ! $command == show ]; then
+	if [ $iface == $base ]; then
+		echo "Interface ($iface) can be its own base."
+	       	exit
+	fi	
+fi
+
+case $command in
+	show)		doShow $iface;;
+	add)		doAdd $iface $base $vlan $ipaddr;;
+	del*|rm|remove)	doDelete $iface;;
+#	mod*)		doModify $iface $ipaddr;;
+	h*)		doUsage;;
+	*)		echo "Invalid command: $command."
+			doUsage;;
+esac
